@@ -43,6 +43,7 @@ const int samplesMaxI = 100;
 float samples[100];
 
 const int sampleDelay = 5;
+const int resampleDelay = 500;
 
 double samplesSum = 0.0;
 const double samplesMax = (double)samplesMaxI;
@@ -249,14 +250,23 @@ void acquireSample() {
 }
 
 void loop() {
-  delay(sampleDelay);
+  if (sampleCount < samplesMaxI) {
+    delay(sampleDelay);
+  }
   acquireSample();
 
   // Update time tracking
   unsigned long currentMillis = millis();
 
-  if ((sampleCount < samplesMaxI) && (!checkInput(currentMillis))) {
+  if ((!checkInput(currentMillis)) && (sampleCount < samplesMaxI)) {
+    // ^ do checkInput before short-circuit so interactions aren't skipped!
     return;
+  }
+
+  if (sampleCount == samplesMaxI) {
+    // We are rotating the buffer, so after buffer fills this code is going to repeat quickly
+    //   (so slow it down):
+    delay(resampleDelay);
   }
 
   calculateTemp(currentMillis, false);
