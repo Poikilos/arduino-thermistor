@@ -1,4 +1,6 @@
-#include <LiquidCrystal.h>
+//#include <LiquidCrystal.h>
+#include <LiquidCrystal_I2C.h>
+#include  <Wire.h>
 
 // Thermistor setup
 int ThermistorPin = 0;
@@ -8,7 +10,8 @@ float logR2, R2, T;
 float c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
 
 // LCD setup
-LiquidCrystal lcd(7, 8, 9, 10, 11, 12);
+// LiquidCrystal lcd(7, 8, 9, 10, 11, 12);
+LiquidCrystal_I2C lcd(0x27,  16, 2);
 
 // LED pins
 const int redPin = 5;
@@ -62,8 +65,11 @@ long lastTempLostSecond = -1;
 
 // Cursor management
 int cursorIdx = 0;
-int prevCursorIdx = 0;
-const char cursor = '\x7E'; // Right-pointing arrow (fallback)
+int prevCursorIdx = -1;  // -1 to force first draw
+const char cursorChar = '\x7E'; // Right-pointing arrow (fallback)
+
+const int optionX = 12; // where to start right side options
+const int optionCursorX = optionX - 1; // don't clear this when clearing left column (managed by cursor code)
 
 // Encoder state
 // int lastClkState;
@@ -108,7 +114,12 @@ String millisecondsToHMS(long ms) {
 
 void setup() {
   // Initialize LCD
-  lcd.begin(16, 2);
+  // lcd.begin(16, 2);
+
+  // Initialize I2C LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
 
   // Initialize LED pins
   pinMode(redPin, OUTPUT);
@@ -135,6 +146,7 @@ void setup() {
   // Set initial time tracking
   tempLostTick = millis();
   tempReachedTick = -1;
+  showState();
 }
 
 void checkTemp() {
@@ -196,7 +208,7 @@ void checkState(unsigned long currentMillis, bool forceOutputCheck) {
 
   // Check if target minutes reached
   if (tempReachedTick > -1 && (tempReachedTick / 1000 / 60) >= targetMinutes) {
-    state = STATE_DONE;
+    setState(STATE_DONE);
   }
 
   if ((currentMillis - lastDebounceTime >= debounceDelay) || forceOutputCheck) {
@@ -279,7 +291,7 @@ void updateLCD(unsigned long currentMillis, float T) {
 
   String unit = fahrenheit ? "F" : "C";
   // Update LCD
-  lcd.clear();
+  // lcd.clear();  // commented for partial updates!
 
   // Handle cursor and state changes
   if (cursorIdx != prevCursorIdx) {
@@ -287,31 +299,24 @@ void updateLCD(unsigned long currentMillis, float T) {
     lcd.setCursor(0, 0);
     Serial.print("lcd.cursorIdx=");
     Serial.println(cursorIdx);
-    lcd.write(cursorIdx == 0 ? cursor : ' ');
+    lcd.write(cursorIdx == 0 ? cursorChar : ' ');
     lcd.setCursor(0, 1);
-    lcd.write(cursorIdx == 1 ? cursor : ' ');
+    lcd.write(cursorIdx == 1 ? cursorChar : ' ');
     lcd.setCursor(11, 0);
-    lcd.write(cursorIdx == 2 ? cursor : ' ');
+    lcd.write(cursorIdx == 2 ? cursorChar : ' ');
 
     // Update state based on cursor change
     if (prevCursorIdx == 2) {
-      state = STATE_OFF;
+      setState(STATE_OFF);
     } else if (cursorIdx == 2) {
-      state = STATE_ON;
+      setState(STATE_ON);
     }
-
-    // Write state string at (12,0)
-    lcd.setCursor(12, 0);
-    if (state == STATE_ON) {
-      lcd.print("ON  ");
-    } else if (state == STATE_OFF) {
-      lcd.print("OFF ");
-    } else {
-      lcd.print("DONE");
-    }
-
+    showState();
     prevCursorIdx = cursorIdx;
   }
+
+  // const int maxLength = 16;
+  const int maxLength = optionCursorX - 1;  // -1 since one cursor/blank is always to left of the message.
 
   // First line: Temperature
   //if (lastShownTempI != int(T)) {
@@ -329,13 +334,19 @@ void updateLCD(unsigned long currentMillis, float T) {
     lastShownTemp = displayTemp;
     lastUnitIsF = fahrenheit;
     lastTargetTemp = targetTempC;
+
+    // Clear remaining columns
+    for (int i = tempStr.length(); i < maxLength; i++) {
+      lcd.write(' ');
+    }
+
   }
 
   // Second line: Time status
   if (lastTempReachedSecond != tempReachedTick / 1000 / 60 || lastTempLostSecond != tempLostTick / 1000 / 60) {
     Serial.print("lcd.lastTempReachedSecond=");
     Serial.println(lastTempReachedSecond);
-    lcd.setCursor(0, 1);
+    lcd.setCursor(1, 1);
     String line2;
     if (tempLostTick > -1) {
       line2 = "0/" + millisecondsToHMS((long)targetMinutes * 60 * 1000) + " Pre. " + millisecondsToHMS(currentMillis - tempLostTick) + "/";
@@ -344,12 +355,33 @@ void updateLCD(unsigned long currentMillis, float T) {
     }
     lcd.print(line2);
     // Clear remaining columns
-    for (int i = line2.length(); i < 16; i++) {
+    for (int i = line2.length(); i < maxLength; i++) {
       lcd.write(' ');
     }
     lastTempReachedSecond = tempReachedTick / 1000 / 60;
     lastTempLostSecond = tempLostTick / 1000 / 60;
   }
+}
+
+void setState(int newState) {
+  if (newState != state) {
+    state = newState;
+    showState();
+  }
+  state = newState;
+}
+
+void showState() {
+    // Write state string at (12,0)
+    lcd.setCursor(12, 0);  // near right edge of 1st row
+    if (state == STATE_ON) {
+      lcd.print("ON  ");
+    } else if (state == STATE_OFF) {
+      lcd.print("OFF ");
+    } else {
+      lcd.print("DONE");
+    }
+
 }
 
 void changeValue(bool right)
