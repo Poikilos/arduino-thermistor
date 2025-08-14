@@ -10,13 +10,17 @@ float logR2, R2, T;
 float c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
 
 // LCD setup
+const int screenW = 16;
+const int screenH = 2;
 // LiquidCrystal lcd(7, 8, 9, 10, 11, 12);
-LiquidCrystal_I2C lcd(0x27,  16, 2);
+LiquidCrystal_I2C lcd(0x27,  screenW, screenH);
 
 // LED pins
 const int redPin = 5;
 const int greenPin = 6;
 const int yellowPin = 3;
+
+bool warming = false;
 
 // Encoder pins
 const int clkPin = 2;
@@ -30,30 +34,30 @@ int targetMinutes = 240;
 bool fahrenheit = false;
 
 // State management
-const int STATE_OFF = 0;
-const int STATE_ON = 1;
-const int STATE_DONE = -1;
-int state = STATE_OFF;
-const int accumulateCountI = 200;
+const int MODE_OFF = 0;
+const int MODE_ON = 1;
+const int MODE_DONE = -1;
+int mode = MODE_OFF;
+const int samplesMaxI = 200;
 const int sampleDelay = 5;
 
-double accumulatedC = 0.0;
-const double accumulateCount = (double)accumulateCountI;
+double samplesSum = 0.0;
+const double samplesMax = (double)samplesMaxI;
 // ^ "On the Uno and other ATMEGA based boards, Double precision floating-point number occupies four bytes.
 //   That is, the double implementation is exactly the same as the float,
 //   with no gain in precision. On the Arduino Due, doubles have 8-byte (64 bit) precision."
-int accumulated = 0;
+int sampleCount = 0;
 
-// const float variance = (float)(0.43 * 10.0 / accumulateCount);
+// const float variance = (float)(0.43 * 10.0 / samplesMax);
 // ^ varies by around 0.42 if taking an average of 10 samples, so check difference rather than truncated/rounded.
-const float variance = (float)(0.23 * 100.0 / accumulateCount);
+const float variance = (float)(0.23 * 100.0 / samplesMax);
 // ^ varies by around 0.23 if taking an average of 100 samples, so check difference rather than truncated/rounded.
 
 
 // Time tracking
 long tempReachedTick = -1;
 long stateChangeT = -1000;
-long tempLostTick = 0;
+long tempLostTick = -1;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 250; // 250ms debounce
 int lastShownTempI = -1;
@@ -67,6 +71,7 @@ long lastTempLostSecond = -1;
 int cursorIdx = 0;
 int prevCursorIdx = -1;  // -1 to force first draw
 const char cursorChar = '\x7E'; // Right-pointing arrow (fallback)
+String heatingStr = "+";
 
 const int optionX = 12; // where to start right side options
 const int optionCursorX = optionX - 1; // don't clear this when clearing left column (managed by cursor code)
@@ -84,8 +89,9 @@ unsigned long lastInterruptTime = 0;
 const unsigned long interruptDebounceDelay = 10; // 10ms debounce for encoder
 
 
-// Convert milliseconds to HMS format
-String millisecondsToHMS(long ms) {
+// Convert milliseconds to human-readable format
+//[<h>h][<m>m]<s>s (last part only shown if showSeconds is true)
+String hr_milliseconds(long ms, bool showSeconds) {
   long seconds = ms / 1000;
   long hours = seconds / 3600;
   seconds %= 3600;
@@ -97,24 +103,40 @@ String millisecondsToHMS(long ms) {
     result += String(hours) + "h";
     if (minutes > 0 || seconds > 0) {
       result += String(minutes) + "m";
-      if (seconds > 0) {
+      if ((seconds > 0) && showSeconds) {
         result += String(seconds) + "s";
       }
     }
   } else if (minutes > 0) {
     result += String(minutes) + "m";
-    if (seconds > 0) {
+    if ((seconds > 0) && showSeconds) {
       result += String(seconds) + "s";
     }
   } else {
-    result += String(seconds) + "s";
+    if (showSeconds) {
+      result += String(seconds) + "s";
+    }
+    else {
+      result += "0m";
+    }
   }
   return result;
 }
 
+
+String millisecondsToHMS(long ms) {
+    return hr_milliseconds(ms, true);
+}
+
+String millisecondsToHM(long ms) {
+    return hr_milliseconds(ms, false);
+}
+
+
+
 void setup() {
   // Initialize LCD
-  // lcd.begin(16, 2);
+  // lcd.begin(screenW, screenH);
 
   // Initialize I2C LCD
   lcd.init();
@@ -128,6 +150,8 @@ void setup() {
 
   // Set initial LED states
   digitalWrite(redPin, LOW);
+  setWarming(false);
+
   digitalWrite(greenPin, LOW);
   digitalWrite(yellowPin, LOW);
 
@@ -144,44 +168,47 @@ void setup() {
   // ^ RISING, since CHANGE gets called twice per notch (LOW to HIGH *and* HIGH to LOW).
   Serial.begin(9600);
   // Set initial time tracking
-  tempLostTick = millis();
+  tempLostTick = -1;
   tempReachedTick = -1;
-  showState();
+  showMode();
 }
 
-void checkTemp() {
+void acquireTemp() {
   // Read thermistor
   Vo = analogRead(ThermistorPin);
   R2 = R1 * (1023.0 / (float)Vo - 1.0);
   logR2 = log(R2);
   T = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
   T = T - 273.15; // Temperature in Celsius
-  accumulatedC += T;
-  accumulated += 1;  
+  samplesSum += T;
+  sampleCount += 1;
 }
 
 void loop() {
   delay(sampleDelay);
-  checkTemp();
+  acquireTemp();
 
   // Update time tracking
   unsigned long currentMillis = millis();
 
-  if ((accumulated < accumulateCountI) && (!checkInput(currentMillis))) {
+  if ((sampleCount < samplesMaxI) && (!checkInput(currentMillis))) {
     return;
   }
-  
-  checkState(currentMillis, false);
+
+  calculateTemp(currentMillis, false);
 }
 
-void checkState(unsigned long currentMillis, bool forceOutputCheck) {
-  if (accumulated < 1) {
-    checkTemp();
+void calculateTemp(unsigned long currentMillis, bool forceOutputCheck) {
+  if (sampleCount < 1) {
+    acquireTemp();
   }
-  T = accumulatedC / accumulateCount;  // Get average of (accumulateCountI) value(s).
-  if (accumulated >= accumulateCountI) {
-    accumulatedC = 0;
-    accumulated = 0;
+  T = samplesSum / (double)sampleCount;  // Get average temperature
+  if (sampleCount >= samplesMaxI) {
+    // reset the sample pool
+    // TODO: ideally this should use a rotating buffer (instead of a sum)
+    //   so we get the most recent average and a steady curve.
+    samplesSum = 0;
+    sampleCount = 0;
   }
 
   if (T >= targetTempC) {
@@ -208,7 +235,7 @@ void checkState(unsigned long currentMillis, bool forceOutputCheck) {
 
   // Check if target minutes reached
   if (tempReachedTick > -1 && (tempReachedTick / 1000 / 60) >= targetMinutes) {
-    setState(STATE_DONE);
+    setMode(currentMillis, MODE_DONE);
   }
 
   if ((currentMillis - lastDebounceTime >= debounceDelay) || forceOutputCheck) {
@@ -234,19 +261,28 @@ bool checkInput(unsigned long currentMillis) {
     cursorIdx = (cursorIdx + 1) % 3; // Cycle 0,1,2
     lastSwitchTime = currentMillis;
     changed = true;
-    checkState(currentMillis, true);
+    calculateTemp(currentMillis, true);
   }
+}
+
+void setWarming(bool enable) {
+  if (warming != enable) {
+    warming = enable;
+    showMode();
+  }
+  warming = enable;
 }
 
 void updateLEDs(unsigned long currentMillis, float T) {
     String unit = fahrenheit ? "F" : "C";
 
     // Update LEDs with debounce
-    bool warming = (state == STATE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
-    if (state == STATE_ON) {
-      digitalWrite(redPin, warming);
+    bool heatPinState = (mode == MODE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
+    setWarming(heatPinState);
+    if (mode == MODE_ON) {
+      digitalWrite(redPin, heatPinState);
       digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
-      digitalWrite(yellowPin, warming);
+      digitalWrite(yellowPin, heatPinState);
       // Serial.print("ON");
     } else {
       digitalWrite(redPin, LOW);
@@ -254,7 +290,7 @@ void updateLEDs(unsigned long currentMillis, float T) {
       digitalWrite(yellowPin, LOW);
       // Serial.print("OFF");
     }
-    Serial.print((state==STATE_OFF)?"OFF":((state==STATE_ON)?"ON":("DONE")));
+    Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
     Serial.print(" warming=");
     Serial.print(warming);
     Serial.print(" temperature=");
@@ -277,8 +313,8 @@ void updateLEDs(unsigned long currentMillis, float T) {
       Serial.print(millisecondsToHMS((long)targetMinutes*60*1000));
     }
     else {//cursorIdx==2
-      Serial.print("state=");
-      Serial.print((state==STATE_OFF)?"OFF":((state==STATE_ON)?"ON":("DONE")));
+      Serial.print("mode=");
+      Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
     }
     Serial.println();
 
@@ -293,7 +329,7 @@ void updateLCD(unsigned long currentMillis, float T) {
   // Update LCD
   // lcd.clear();  // commented for partial updates!
 
-  // Handle cursor and state changes
+  // Handle cursor and mode changes
   if (cursorIdx != prevCursorIdx) {
     // Update cursor positions
     lcd.setCursor(0, 0);
@@ -305,18 +341,18 @@ void updateLCD(unsigned long currentMillis, float T) {
     lcd.setCursor(11, 0);
     lcd.write(cursorIdx == 2 ? cursorChar : ' ');
 
-    // Update state based on cursor change
+    // Update mode based on cursor change
     if (prevCursorIdx == 2) {
-      setState(STATE_OFF);
+      setMode(currentMillis, MODE_OFF);
     } else if (cursorIdx == 2) {
-      setState(STATE_ON);
+      setMode(currentMillis, MODE_ON);
     }
-    showState();
+    showMode();
     prevCursorIdx = cursorIdx;
   }
 
   // const int maxLength = 16;
-  const int maxLength = optionCursorX - 1;  // -1 since one cursor/blank is always to left of the message.
+  const int maxLength = optionCursorX;
 
   // First line: Temperature
   //if (lastShownTempI != int(T)) {
@@ -336,47 +372,62 @@ void updateLCD(unsigned long currentMillis, float T) {
     lastTargetTemp = targetTempC;
 
     // Clear remaining columns
-    for (int i = tempStr.length(); i < maxLength; i++) {
+    for (int i = tempStr.length() + 1; i < maxLength; i++) {  // +1 since one cursor/blank is always to left of the message.
       lcd.write(' ');
     }
 
   }
 
   // Second line: Time status
-  if (lastTempReachedSecond != tempReachedTick / 1000 / 60 || lastTempLostSecond != tempLostTick / 1000 / 60) {
-    Serial.print("lcd.lastTempReachedSecond=");
-    Serial.println(lastTempReachedSecond);
+  if ((tempReachedTick==-1) && (tempLostTick==-1)) {
+    Serial.print("error=\"Must call calculateTemp at least once before updateLCD\"");
+  }
+  else if ((lastTempReachedSecond != (long)((currentMillis - tempReachedTick) / 1000)) || (lastTempLostSecond != (long)((currentMillis - tempLostTick) / 1000))) {
+    //Serial.print("lcd.tempReachedTick=");
+    //Serial.println(tempReachedTick);
+    //Serial.print("lcd.tempLostTick=");
+    //Serial.println(tempLostTick);
     lcd.setCursor(1, 1);
     String line2;
     if (tempLostTick > -1) {
-      line2 = "0/" + millisecondsToHMS((long)targetMinutes * 60 * 1000) + " Pre. " + millisecondsToHMS(currentMillis - tempLostTick) + "/";
+      line2 = "0/" + millisecondsToHMS((long)targetMinutes * 60 * 1000) + (warming?" pre":" off") + millisecondsToHMS(currentMillis - tempLostTick);
     } else {
-      line2 = millisecondsToHMS(currentMillis - tempReachedTick) + "/" + millisecondsToHMS((long)targetMinutes * 60 * 1000);
+      line2 = millisecondsToHMS(currentMillis - tempReachedTick) + "/" + millisecondsToHM((long)targetMinutes * 60 * 1000);
     }
     lcd.print(line2);
     // Clear remaining columns
-    for (int i = line2.length(); i < maxLength; i++) {
+    for (int i = line2.length() + 1; i < screenW; i++) {  // +1 since one cursor/blank is always to left of the message.
+      // Don't use maxLength, since there is no room for anything on the 2nd line anyway (may be long such as "0/3h30m off1m18s" or "1h30m18s/3h30m")
       lcd.write(' ');
     }
-    lastTempReachedSecond = tempReachedTick / 1000 / 60;
-    lastTempLostSecond = tempLostTick / 1000 / 60;
+    // Even if -1, do division same as the "if" condition:
+    lastTempReachedSecond = (long)((currentMillis - tempReachedTick) / 1000);
+    lastTempLostSecond = (long)((currentMillis - tempLostTick) / 1000);
+    //Serial.print("lcd.lastTempReachedSecond=");
+    //Serial.println(lastTempReachedSecond);
+    //Serial.print("lcd.lastTempLostSecond=");
+    //Serial.println(lastTempLostSecond);
   }
 }
 
-void setState(int newState) {
-  if (newState != state) {
-    state = newState;
-    showState();
+void setMode(long currentMillis, int newMode) {
+  if (newMode != mode) {
+    mode = newMode;
+    showMode();
+    // Don't say preheating 1hr if was off 1hr, and vise versa:
+    if ((tempLostTick != -1) && (currentMillis != -1)) {
+      tempLostTick = (currentMillis == -1) ? millis() : currentMillis;
+    }
   }
-  state = newState;
+  mode = newMode;
 }
 
-void showState() {
-    // Write state string at (12,0)
+void showMode() {
+    // Write mode string at (12,0)
     lcd.setCursor(12, 0);  // near right edge of 1st row
-    if (state == STATE_ON) {
-      lcd.print("ON  ");
-    } else if (state == STATE_OFF) {
+    if (mode == MODE_ON) {
+      lcd.print(warming ? ("ON " + heatingStr): "ON  ");
+    } else if (mode == MODE_OFF) {
       lcd.print("OFF ");
     } else {
       lcd.print("DONE");
