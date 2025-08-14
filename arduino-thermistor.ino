@@ -38,7 +38,10 @@ const int MODE_OFF = 0;
 const int MODE_ON = 1;
 const int MODE_DONE = -1;
 int mode = MODE_OFF;
-const int samplesMaxI = 200;
+
+const int samplesMaxI = 100;
+float samples[100];
+
 const int sampleDelay = 5;
 
 double samplesSum = 0.0;
@@ -88,6 +91,34 @@ int lastCLK = 0;
 unsigned long lastInterruptTime = 0;
 const unsigned long interruptDebounceDelay = 10; // 10ms debounce for encoder
 
+double sumSamples() {
+  double sum = 0.0;
+  for (int i=0; i < sampleCount; i++) {
+    sum += (double)samples[i];
+  }
+  return sum;
+}
+
+float averageSamples() {
+  float average = 0.0f;
+  for (int i=0; i < sampleCount; i++) {
+    average += samples[i] / (float)sampleCount;
+  }
+  return average;
+}
+
+float popSample() {
+  if (sampleCount < 1) {
+    Serial.println("error=\"call acquireTemp before popSample after init/clear\"");
+    return 0.0f;
+  }
+  float value = samples[0];
+  for (int i=1; i < sampleCount; i++) {
+    samples[i-1] = samples[i];
+  }
+  sampleCount -= 1;
+  return value;
+}
 
 // Convert milliseconds to human-readable format
 //[<h>h][<m>m]<s>s (last part only shown if showSeconds is true)
@@ -181,6 +212,10 @@ void acquireTemp() {
   T = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
   T = T - 273.15; // Temperature in Celsius
   samplesSum += T;
+  while (sampleCount >= samplesMax) {
+    samplesSum -= popSample();
+  }
+  samples[sampleCount] = T;
   sampleCount += 1;
 }
 
@@ -202,14 +237,9 @@ void calculateTemp(unsigned long currentMillis, bool forceOutputCheck) {
   if (sampleCount < 1) {
     acquireTemp();
   }
-  T = samplesSum / (double)sampleCount;  // Get average temperature
-  if (sampleCount >= samplesMaxI) {
-    // reset the sample pool
-    // TODO: ideally this should use a rotating buffer (instead of a sum)
-    //   so we get the most recent average and a steady curve.
-    samplesSum = 0;
-    sampleCount = 0;
-  }
+  
+  // T = samplesSum / (double)sampleCount;  // smoothed average temperature (quick)
+  T = averageSamples();  // smoothed average temperature
 
   if (T >= targetTempC) {
     if (tempReachedTick == -1) {
