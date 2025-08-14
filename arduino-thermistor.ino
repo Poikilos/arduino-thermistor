@@ -50,10 +50,12 @@ const double samplesMax = (double)samplesMaxI;
 //   That is, the double implementation is exactly the same as the float,
 //   with no gain in precision. On the Arduino Due, doubles have 8-byte (64 bit) precision."
 int sampleCount = 0;
+int oldestIndex = -1;  // allows rotating the buffer without rewriting each value
+int emptyIndex = -1;  // allows rotating the buffer without rewriting each value
 
-// const float variance = (float)(0.43 * 10.0 / samplesMax);
+// const float variance = (float)(0.43 * 10.0 / (float)samplesMax);
 // ^ varies by around 0.42 if taking an average of 10 samples, so check difference rather than truncated/rounded.
-const float variance = (float)(0.23 * 100.0 / samplesMax);
+const float variance = (float)(0.23 * 100.0 / (float)samplesMax);
 // ^ varies by around 0.23 if taking an average of 100 samples, so check difference rather than truncated/rounded.
 
 
@@ -102,6 +104,9 @@ double sumSamples() {
 float averageSamples() {
   float average = 0.0f;
   for (int i=0; i < sampleCount; i++) {
+    if (i == emptyIndex) {
+      continue;
+    }
     average += samples[i] / (float)sampleCount;
   }
   return average;
@@ -109,14 +114,31 @@ float averageSamples() {
 
 float popSample() {
   if (sampleCount < 1) {
-    Serial.println("error=\"call acquireTemp before popSample after init/clear\"");
+    Serial.println("error=\"call acquireSample before popSample after init/clear\"");
     return 0.0f;
   }
-  float value = samples[0];
-  for (int i=1; i < sampleCount; i++) {
-    samples[i-1] = samples[i];
+  if (sampleCount < samplesMaxI) {
+    Serial.println("error=\"call popSample only when buffer is full\"");
+    return 0.0f;
   }
-  sampleCount -= 1;
+
+  // too slow:
+  //float value = samples[0];
+  //for (int i=1; i < sampleCount; i++) {
+  //  samples[i-1] = samples[i];
+  //}
+  // so rotate buffer virtually instead:
+  if (oldestIndex == -1) {
+    oldestIndex = 0;
+  }
+  float value = samples[oldestIndex];
+  emptyIndex = oldestIndex;
+  oldestIndex++;
+  if (oldestIndex == samplesMaxI) {
+    oldestIndex = 0;
+  }
+
+  // sampleCount -= 1;
   return value;
 }
 
@@ -204,24 +226,31 @@ void setup() {
   showMode();
 }
 
-void acquireTemp() {
+// Get the temperature and place it in the smoothing queue.
+void acquireSample() {
   // Read thermistor
   Vo = analogRead(ThermistorPin);
   R2 = R1 * (1023.0 / (float)Vo - 1.0);
   logR2 = log(R2);
   T = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
-  T = T - 273.15; // Temperature in Celsius
-  samplesSum += T;
-  while (sampleCount >= samplesMax) {
+  T = T - 273.15;  // Temperature in Celsius
+  samplesSum += T;  // maintain a pre-smoothed value
+  if (sampleCount >= samplesMax) {
     samplesSum -= popSample();
+    samples[emptyIndex] = T;
+    emptyIndex = -1;
+    // Now there is no empty index, the old empty index is the newest,
+    //   so oldestIndex is one after that.
   }
-  samples[sampleCount] = T;
-  sampleCount += 1;
+  else {
+    samples[sampleCount] = T;
+    sampleCount += 1;
+  }
 }
 
 void loop() {
   delay(sampleDelay);
-  acquireTemp();
+  acquireSample();
 
   // Update time tracking
   unsigned long currentMillis = millis();
@@ -235,11 +264,11 @@ void loop() {
 
 void calculateTemp(unsigned long currentMillis, bool forceOutputCheck) {
   if (sampleCount < 1) {
-    acquireTemp();
+    acquireSample();
   }
-  
-  // T = samplesSum / (double)sampleCount;  // smoothed average temperature (quick)
-  T = averageSamples();  // smoothed average temperature
+
+  T = samplesSum / (double)sampleCount;  // smoothed average temperature (quick)
+  // T = averageSamples();  // smoothed average temperature
 
   if (T >= targetTempC) {
     if (tempReachedTick == -1) {
