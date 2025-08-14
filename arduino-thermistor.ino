@@ -1,6 +1,5 @@
-//#include <LiquidCrystal.h>
 #include <LiquidCrystal_I2C.h>
-#include  <Wire.h>
+#include <Wire.h>
 
 // Thermistor setup
 int ThermistorPin = 0;
@@ -13,7 +12,7 @@ float c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
 const int screenW = 16;
 const int screenH = 2;
 // LiquidCrystal lcd(7, 8, 9, 10, 11, 12);
-LiquidCrystal_I2C lcd(0x27,  screenW, screenH);
+LiquidCrystal_I2C lcd(0x27, screenW, screenH);
 
 // LED pins
 const int redPin = 5;
@@ -26,6 +25,7 @@ bool warming = false;
 const int clkPin = 2;
 const int dtPin = 4;
 const int swPin = 13;
+
 
 // Temperature and time settings
 float targetTempC = 20.0;
@@ -51,8 +51,9 @@ const double samplesMax = (double)samplesMaxI;
 //   That is, the double implementation is exactly the same as the float,
 //   with no gain in precision. On the Arduino Due, doubles have 8-byte (64 bit) precision."
 int sampleCount = 0;
-int oldestIndex = -1;  // allows rotating the buffer without rewriting each value
-int emptyIndex = -1;  // allows rotating the buffer without rewriting each value
+// Allow rotating the buffer without rewriting each value:
+int oldestIndex = -1;
+int emptyIndex = -1;
 
 // const float variance = (float)(0.43 * 10.0 / (float)samplesMax);
 // ^ varies by around 0.42 if taking an average of 10 samples, so check difference rather than truncated/rounded.
@@ -65,12 +66,12 @@ long tempReachedTick = -1;
 long stateChangeT = -1000;
 long tempLostTick = -1;
 unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 250; // 250ms debounce
+const unsigned long debounceDelay = 250; // 250ms debounce for LEDs
 int lastShownTempI = -1;
 float lastShownTemp = -1;
 int lastUnitIsF = fahrenheit;
 long lastTempReachedSecond = -1;
-long lastTempReached = -1;  // temp used when marked reached
+// long lastTempReached = -1;  // temp used when marked reached
 long lastTempLostSecond = -1;
 
 // Cursor management
@@ -83,20 +84,19 @@ const int optionX = 12; // where to start right side options
 const int optionCursorX = optionX - 1; // don't clear this when clearing left column (managed by cursor code)
 
 // Encoder state
-// int lastClkState;
-int lastCount = 0;
-
-// Interrupt 0 on clkPin
-const int interrupt0 = 0;
-int count = 0;
-//CLK initial value
-int lastCLK = 0;
-unsigned long lastInterruptTime = 0;
-const unsigned long interruptDebounceDelay = 10; // 10ms debounce for encoder
+const int interrupt0 = 0; // clkPin (pin 2)
+const int interrupt1 = 1; // dtPin (pin 4)
+volatile int count = 0;
+volatile byte encoderState = 0;
+volatile int stateCount = 0; // Track state transitions per notch
+volatile int lastUsedCount = count;
+volatile int lastCLK = 9999;
+volatile int presses = 0;
+volatile int lastDT = HIGH; // Only count press more than once if user let go!
 
 double sumSamples() {
   double sum = 0.0;
-  for (int i=0; i < sampleCount; i++) {
+  for (int i = 0; i < sampleCount; i++) {
     sum += (double)samples[i];
   }
   return sum;
@@ -167,31 +167,21 @@ String hr_milliseconds(long ms, bool showSeconds) {
       result += String(seconds) + "s";
     }
   } else {
-    if (showSeconds) {
-      result += String(seconds) + "s";
-    }
-    else {
-      result += "0m";
-    }
+    result += showSeconds ? String(seconds) + "s" : "0m";
   }
   return result;
 }
 
-
 String millisecondsToHMS(long ms) {
-    return hr_milliseconds(ms, true);
+  return hr_milliseconds(ms, true);
 }
 
 String millisecondsToHM(long ms) {
-    return hr_milliseconds(ms, false);
+  return hr_milliseconds(ms, false);
 }
 
 
-
 void setup() {
-  // Initialize LCD
-  // lcd.begin(screenW, screenH);
-
   // Initialize I2C LCD
   lcd.init();
   lcd.backlight();
@@ -205,7 +195,6 @@ void setup() {
   // Set initial LED states
   digitalWrite(redPin, LOW);
   setWarming(false);
-
   digitalWrite(greenPin, LOW);
   digitalWrite(yellowPin, LOW);
 
@@ -214,17 +203,28 @@ void setup() {
   pinMode(dtPin, INPUT);
   pinMode(swPin, INPUT);
   digitalWrite(swPin, HIGH);
-  // Grok had made these into one line: INPUT_PULLUP, but 37 Sensor Kit V2.0 documentation says set INPUT and HIGH
+  // Grok had made these into one line: `pinMode(swPin, INPUT_PULLUP);`, but 37 Sensor Kit V2.0 documentation says set INPUT and HIGH
   // lastClkState = digitalRead(clkPin);
+  // lastClk = digitalRead(clkPin);  // TODO: why not declared?
 
-  attachInterrupt(interrupt0, ClockChanged, CHANGE);
+  // attachInterrupt(interrupt0, ClockChanged, CHANGE);
   // attachInterrupt(interrupt0, ClockRising, RISING);
   // ^ RISING, since CHANGE gets called twice per notch (LOW to HIGH *and* HIGH to LOW).
+
+  // Attach interrupts on CLK and DT
+  attachInterrupt(interrupt0, ClockChanged, CHANGE);
+  attachInterrupt(interrupt1, EncoderChanged, CHANGE);
+
+  // Initialize serial for debugging
   Serial.begin(9600);
+
   // Set initial time tracking
   tempLostTick = -1;
   tempReachedTick = -1;
   showMode();
+
+  // Initialize encoder state
+  encoderState = (digitalRead(clkPin) << 1) | digitalRead(dtPin);
 }
 
 // Get the temperature and place it in the smoothing queue.
@@ -242,14 +242,13 @@ void acquireSample() {
     emptyIndex = -1;
     // Now there is no empty index, the old empty index is the newest,
     //   so oldestIndex is one after that.
-  }
-  else {
+  } else {
     samples[sampleCount] = T;
     sampleCount += 1;
   }
 }
 
-void loop() {
+void loopOld() {
   if (sampleCount < samplesMaxI) {
     delay(sampleDelay);
   }
@@ -258,10 +257,13 @@ void loop() {
   // Update time tracking
   unsigned long currentMillis = millis();
 
-  if ((!checkInput(currentMillis)) && (sampleCount < samplesMaxI)) {
-    // ^ do checkInput before short-circuit so interactions aren't skipped!
+  checkInput(currentMillis);
+
+  if ((!handleInput(currentMillis)) && sampleCount < samplesMaxI) {
+    // ^ do handleInput before short-circuit so interactions aren't skipped
     return;
   }
+
 
   if (sampleCount == samplesMaxI) {
     // We are rotating the buffer, so after buffer fills this code is going to repeat quickly
@@ -270,6 +272,32 @@ void loop() {
   }
 
   calculateTemp(currentMillis, false);
+}
+
+void loop() {
+  static unsigned long lastSampleTime = 0;
+  static unsigned long lastResampleTime = 0;
+  unsigned long currentMillis = millis();
+
+  // Non-blocking sample acquisition
+  if (sampleCount < samplesMaxI) {
+    if (currentMillis - lastSampleTime >= sampleDelay) {
+      acquireSample();
+      lastSampleTime = currentMillis;
+    }
+  } else if (currentMillis - lastResampleTime >= resampleDelay) {
+    acquireSample();
+    lastResampleTime = currentMillis;
+  }
+
+  // Always check inputs to avoid missing presses
+  checkInput(currentMillis);
+  bool changed = handleInput(currentMillis);
+
+  // Process temperature if buffer is full or input changed
+  if (sampleCount >= samplesMaxI || changed) {
+    calculateTemp(currentMillis, changed);
+  }
 }
 
 void calculateTemp(unsigned long currentMillis, bool forceOutputCheck) {
@@ -314,9 +342,10 @@ void calculateTemp(unsigned long currentMillis, bool forceOutputCheck) {
   updateLCD(currentMillis, T);
 }
 
+// check encoder button (*not* rotation)
 bool checkInput(unsigned long currentMillis) {
+  // encoder rotation
   bool changed = false;
-  // Handle encoder rotation
   /*
   int clkState = digitalRead(clkPin);
   if (clkState != lastClkState) {
@@ -324,14 +353,28 @@ bool checkInput(unsigned long currentMillis) {
   }
   lastClkState = clkState;
   */
+  int dtValue = digitalRead(swPin);
+  if (dtValue == LOW && lastDT != LOW) {
+    presses++;
+    changed = true;
+  }
+  lastDT = dtValue;
+  return changed; // presses > 0;
+}
+
+bool handleInput(unsigned long currentMillis) {
   // Handle encoder switch
+  bool handled = false;
   static unsigned long lastSwitchTime = 0;
-  if (digitalRead(swPin) == LOW && (currentMillis - lastSwitchTime) > 250) {
+  if (presses > 0 && (currentMillis - lastSwitchTime) > 500) {
     cursorIdx = (cursorIdx + 1) % 3; // Cycle 0,1,2
     lastSwitchTime = currentMillis;
-    changed = true;
+    // changed = true;
     calculateTemp(currentMillis, true);
+    presses = 0;
+    handled = true;
   }
+  return handled;
 }
 
 void setWarming(bool enable) {
@@ -339,68 +382,54 @@ void setWarming(bool enable) {
     warming = enable;
     showMode();
   }
-  warming = enable;
 }
 
 void updateLEDs(unsigned long currentMillis, float T) {
-    String unit = fahrenheit ? "F" : "C";
-
-    // Update LEDs with debounce
-    bool heatPinState = (mode == MODE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
-    setWarming(heatPinState);
-    if (mode == MODE_ON) {
-      digitalWrite(redPin, heatPinState);
-      digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
-      digitalWrite(yellowPin, heatPinState);
-      // Serial.print("ON");
-    } else {
-      digitalWrite(redPin, LOW);
-      digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
-      digitalWrite(yellowPin, LOW);
-      // Serial.print("OFF");
-    }
-    Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
-    Serial.print(" warming=");
-    Serial.print(warming);
-    Serial.print(" temperature=");
-    Serial.print(T);
-    Serial.print(unit);
-    Serial.print("/");
+  String unit = fahrenheit ? "F" : "C";
+  bool heatPinState = (mode == MODE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
+  setWarming(heatPinState);
+  if (mode == MODE_ON) {
+    digitalWrite(redPin, heatPinState);
+    digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
+    digitalWrite(yellowPin, heatPinState);
+  } else {
+    digitalWrite(redPin, LOW);
+    digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
+    digitalWrite(yellowPin, LOW);
+  }
+  Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
+  Serial.print(" warming=");
+  Serial.print(warming);
+  Serial.print(" temperature=");
+  Serial.print(T);
+  Serial.print(unit);
+  Serial.print("/");
+  Serial.print(targetTempC);
+  Serial.print("C");
+  if (tempReachedTick > -1) {
+    Serial.print(" sustained=");
+    Serial.print(millisecondsToHMS((currentMillis-tempReachedTick)));
+  }
+  Serial.print(" set ");
+  if (cursorIdx==0) {
+    Serial.print("target=");
     Serial.print(targetTempC);
-    Serial.print("C");
-    if (tempReachedTick > -1) {
-      Serial.print(" sustained=");
-      Serial.print(millisecondsToHMS((currentMillis-tempReachedTick)));
-    }
-    Serial.print(" set ");
-    if (cursorIdx==0) {
-      Serial.print("target=");
-      Serial.print(targetTempC);
-    }
-    else if (cursorIdx==1) {
-      Serial.print("time=");
-      Serial.print(millisecondsToHMS((long)targetMinutes*60*1000));
-    }
-    else {//cursorIdx==2
-      Serial.print("mode=");
-      Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
-    }
-    Serial.println();
-
-    lastDebounceTime = currentMillis;
+  } else if (cursorIdx==1) {
+    Serial.print("time=");
+    Serial.print(millisecondsToHMS((long)targetMinutes*60*1000));
+  } else {  //cursorIdx==2
+    Serial.print("mode=");
+    Serial.print((mode==MODE_OFF)?"OFF":((mode==MODE_ON)?"ON":("DONE")));
+  }
+  Serial.println();
+  lastDebounceTime = currentMillis;
 }
 
 void updateLCD(unsigned long currentMillis, float T) {
-  // Convert to Fahrenheit if needed
   float displayTemp = fahrenheit ? (T * 9.0 / 5.0 + 32.0) : T;
-
   String unit = fahrenheit ? "F" : "C";
-  // Update LCD
-  // lcd.clear();  // commented for partial updates!
 
-  // Handle cursor and mode changes
   if (cursorIdx != prevCursorIdx) {
-    // Update cursor positions
     lcd.setCursor(0, 0);
     Serial.print("lcd.cursorIdx=");
     Serial.println(cursorIdx);
@@ -409,8 +438,6 @@ void updateLCD(unsigned long currentMillis, float T) {
     lcd.write(cursorIdx == 1 ? cursorChar : ' ');
     lcd.setCursor(11, 0);
     lcd.write(cursorIdx == 2 ? cursorChar : ' ');
-
-    // Update mode based on cursor change
     if (prevCursorIdx == 2) {
       setMode(currentMillis, MODE_OFF);
     } else if (cursorIdx == 2) {
@@ -424,7 +451,6 @@ void updateLCD(unsigned long currentMillis, float T) {
   const int maxLength = optionCursorX;
 
   // First line: Temperature
-  //if (lastShownTempI != int(T)) {
   int roundDisplayTemp = (int)(displayTemp);
   // if ((lastShownTempI != roundDisplayTemp) || (lastUnitIsF != fahrenheit) || (lastTargetTemp != targetTempC)) {
   if ((abs(lastShownTemp-displayTemp) > variance) || (lastUnitIsF != fahrenheit) || (lastTargetTemp != targetTempC)) {
@@ -439,23 +465,16 @@ void updateLCD(unsigned long currentMillis, float T) {
     lastShownTemp = displayTemp;
     lastUnitIsF = fahrenheit;
     lastTargetTemp = targetTempC;
-
     // Clear remaining columns
     for (int i = tempStr.length() + 1; i < maxLength; i++) {  // +1 since one cursor/blank is always to left of the message.
       lcd.write(' ');
     }
-
   }
 
   // Second line: Time status
   if ((tempReachedTick==-1) && (tempLostTick==-1)) {
-    Serial.print("error=\"Must call calculateTemp at least once before updateLCD\"");
-  }
-  else if ((lastTempReachedSecond != (long)((currentMillis - tempReachedTick) / 1000)) || (lastTempLostSecond != (long)((currentMillis - tempLostTick) / 1000))) {
-    //Serial.print("lcd.tempReachedTick=");
-    //Serial.println(tempReachedTick);
-    //Serial.print("lcd.tempLostTick=");
-    //Serial.println(tempLostTick);
+    Serial.println("error=\"Must call calculateTemp at least once before updateLCD\"");
+  } else if ((lastTempReachedSecond != (long)((currentMillis - tempReachedTick) / 1000)) || (lastTempLostSecond != (long)((currentMillis - tempLostTick) / 1000))) {
     lcd.setCursor(1, 1);
     String line2;
     if (tempLostTick > -1) {
@@ -472,10 +491,6 @@ void updateLCD(unsigned long currentMillis, float T) {
     // Even if -1, do division same as the "if" condition:
     lastTempReachedSecond = (long)((currentMillis - tempReachedTick) / 1000);
     lastTempLostSecond = (long)((currentMillis - tempLostTick) / 1000);
-    //Serial.print("lcd.lastTempReachedSecond=");
-    //Serial.println(lastTempReachedSecond);
-    //Serial.print("lcd.lastTempLostSecond=");
-    //Serial.println(lastTempLostSecond);
   }
 }
 
@@ -488,83 +503,65 @@ void setMode(long currentMillis, int newMode) {
       tempLostTick = (currentMillis == -1) ? millis() : currentMillis;
     }
   }
-  mode = newMode;
 }
 
 void showMode() {
-    // Write mode string at (12,0)
-    lcd.setCursor(12, 0);  // near right edge of 1st row
-    if (mode == MODE_ON) {
-      lcd.print(warming ? ("ON " + heatingStr): "ON  ");
-    } else if (mode == MODE_OFF) {
-      lcd.print("OFF ");
-    } else {
-      lcd.print("DONE");
-    }
-
+  // Write mode string at (12,0)
+  lcd.setCursor(12, 0);  // near right edge of 1st row
+  if (mode == MODE_ON) {
+    lcd.print(warming ? ("ON " + heatingStr) : "ON  ");
+  } else if (mode == MODE_OFF) {
+    lcd.print("OFF ");
+  } else {
+    lcd.print("DONE");
+  }
 }
 
-void changeValue(bool right)
-{
-    if (right) { // Right rotation
-      if (cursorIdx == 0) {
-        targetTempC += 5;
-      } else if (cursorIdx == 1) {
-        targetMinutes += 30;
-      }
-    } else { // Left rotation
-      if (cursorIdx == 0) {
-        targetTempC -= 5;
-      } else if (cursorIdx == 1) {
-        targetMinutes = max(0, targetMinutes - 30); // Prevent negative
-      }
+void changeValue(bool right) {
+  if (right) { // Right rotation
+    if (cursorIdx == 0) {
+      targetTempC += 5;
+    } else if (cursorIdx == 1) {
+      targetMinutes += 30;
     }
+  } else { // Left rotation
+    if (cursorIdx == 0) {
+      targetTempC -= 5;
+    } else if (cursorIdx == 1) {
+      targetMinutes = max(0, targetMinutes - 30); // Prevent negative
+    }
+  }
 }
 
-void ClockChanged()
-{
-  // NOTE: CHANGE gets called twice per notch, on LOW to HIGH *and* HIGH to LOW
-  //   So attach to interrupt using the RISING constant.
-  // based on 37 Sensor Kit V2.0 encoder example
-  //Read the CLK pin level
-  int clkValue = digitalRead(clkPin);
-  //Read the DT pin level
-  int dtValue = digitalRead(dtPin);
-  if (lastCLK != clkValue)
-  {
-    lastCLK = clkValue;
-    //CLK and inconsistent DT + 1, otherwise - 1
-    bool right = clkValue == dtValue;
-    count += (right ? 1 : -1);
-    if (count % 2 == 0) {
-        changeValue(right);
-    } // else skip FALLING
-    Serial.print("count:");
-    Serial.println(count);
+void EncoderChanged() {
+  // checkInput();
+  if (digitalRead(swPin) == LOW) {
+    presses++;
   }
 }
 
 
-void ClockRising()
+//The interrupt handlers
+void ClockChanged()
 {
-  //unsigned long currentInterruptTime = millis();
-  //if (currentInterruptTime - lastInterruptTime < interruptDebounceDelay) {
-  //  return; // Ignore if within debounce period
-  //}
-  //lastInterruptTime = currentInterruptTime;
+  // based on 37 Sensor Kit V2.0 example
+  int clkValue = digitalRead(clkPin);//Read the CLK pin level
+  int dtValue = digitalRead(dtPin);//Read the DT pin level
+  if (lastCLK != clkValue)
+  {
+    lastCLK = clkValue;
+    count += (clkValue != dtValue ? 1 : -1);//CLK and inconsistent DT + 1, otherwise - 1
 
-  // NOTE: CHANGE gets called twice per notch, on LOW to HIGH *and* HIGH to LOW
-  //   So attach to interrupt using the RISING constant.
-  // based on 37 Sensor Kit V2.0 encoder example
-  //Read the CLK pin level
-  int clkValue = digitalRead(clkPin);
-  //Read the DT pin level
-  int dtValue = digitalRead(dtPin);
-  // NOTE: Don't check lastCLK != clkValue, only occurs in change in direction in case of RISING
-  //CLK and inconsistent DT + 1, otherwise - 1
-  bool right = clkValue == dtValue;
-  changeValue(right);
-  count += (right ? 1 : -1);
-  Serial.print("count:");
-  Serial.println(count);
+    //Serial.print("count:");
+    //Serial.println(count);
+    if (abs(lastUsedCount-count) > 1) {
+      if (count < lastUsedCount) {
+        changeValue(true); // Right rotation
+      }
+      else {
+        changeValue(false); // Left rotation
+      }
+      lastUsedCount = count;
+    }
+  }
 }

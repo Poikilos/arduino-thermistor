@@ -48,3 +48,10 @@ Only write the second line if a global lastTempReachedSecond != tempReachedTick 
 Then set a global lastTempReachedSecond = tempReachedTick / 1000 / 60
 Then set a global lastTempLostTick = tempLostTick / 1000 / 60
 
+- 2025-08-14
+
+Here is the new version:
+
+- paste ff77b1d
+
+How can I use interrupts so that processing doesn't cause encoder wheel turns or presses to be skipped?
