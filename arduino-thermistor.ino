@@ -22,6 +22,7 @@ const int swPin = 13;
 
 // Temperature and time settings
 float targetTempC = 20.0;
+float lastTargetTemp = -1;
 int targetMinutes = 240;
 bool fahrenheit = false;
 
@@ -30,13 +31,31 @@ const int STATE_OFF = 0;
 const int STATE_ON = 1;
 const int STATE_DONE = -1;
 int state = STATE_OFF;
+const int accumulateCountI = 200;
+const int sampleDelay = 5;
+
+double accumulatedC = 0.0;
+const double accumulateCount = (double)accumulateCountI;
+// ^ "On the Uno and other ATMEGA based boards, Double precision floating-point number occupies four bytes.
+//   That is, the double implementation is exactly the same as the float,
+//   with no gain in precision. On the Arduino Due, doubles have 8-byte (64 bit) precision."
+int accumulated = 0;
+
+// const float variance = (float)(0.43 * 10.0 / accumulateCount);
+// ^ varies by around 0.42 if taking an average of 10 samples, so check difference rather than truncated/rounded.
+const float variance = (float)(0.23 * 100.0 / accumulateCount);
+// ^ varies by around 0.23 if taking an average of 100 samples, so check difference rather than truncated/rounded.
+
 
 // Time tracking
 long tempReachedTick = -1;
+long stateChangeT = -1000;
 long tempLostTick = 0;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 250; // 250ms debounce
 int lastShownTempI = -1;
+float lastShownTemp = -1;
+int lastUnitIsF = fahrenheit;
 long lastTempReachedSecond = -1;
 long lastTempReached = -1;  // temp used when marked reached
 long lastTempLostSecond = -1;
@@ -118,20 +137,41 @@ void setup() {
   tempReachedTick = -1;
 }
 
-void loop() {
+void checkTemp() {
   // Read thermistor
   Vo = analogRead(ThermistorPin);
   R2 = R1 * (1023.0 / (float)Vo - 1.0);
   logR2 = log(R2);
   T = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
   T = T - 273.15; // Temperature in Celsius
+  accumulatedC += T;
+  accumulated += 1;  
+}
 
-  // Convert to Fahrenheit if needed
-  float displayTemp = fahrenheit ? (T * 9.0 / 5.0 + 32.0) : T;
-  String unit = fahrenheit ? "F" : "C";
+void loop() {
+  delay(sampleDelay);
+  checkTemp();
 
   // Update time tracking
   unsigned long currentMillis = millis();
+
+  if ((accumulated < accumulateCountI) && (!checkInput(currentMillis))) {
+    return;
+  }
+  
+  checkState(currentMillis, false);
+}
+
+void checkState(unsigned long currentMillis, bool forceOutputCheck) {
+  if (accumulated < 1) {
+    checkTemp();
+  }
+  T = accumulatedC / accumulateCount;  // Get average of (accumulateCountI) value(s).
+  if (accumulated >= accumulateCountI) {
+    accumulatedC = 0;
+    accumulated = 0;
+  }
+
   if (T >= targetTempC) {
     if (tempReachedTick == -1) {
       Serial.print(T);
@@ -140,6 +180,7 @@ void loop() {
       Serial.println("C");
       tempReachedTick = currentMillis;
       tempLostTick = -1;
+      stateChangeT = (int)T;
     }
   } else {
     if (tempLostTick == -1) {
@@ -149,6 +190,7 @@ void loop() {
       Serial.println("C");
       tempLostTick = currentMillis;
       tempReachedTick = -1;
+      stateChangeT = (int)T;
     }
   }
 
@@ -157,6 +199,15 @@ void loop() {
     state = STATE_DONE;
   }
 
+  if ((currentMillis - lastDebounceTime >= debounceDelay) || forceOutputCheck) {
+    updateLEDs(currentMillis, T);
+  }
+
+  updateLCD(currentMillis, T);
+}
+
+bool checkInput(unsigned long currentMillis) {
+  bool changed = false;
   // Handle encoder rotation
   /*
   int clkState = digitalRead(clkPin);
@@ -170,11 +221,16 @@ void loop() {
   if (digitalRead(swPin) == LOW && (currentMillis - lastSwitchTime) > 250) {
     cursorIdx = (cursorIdx + 1) % 3; // Cycle 0,1,2
     lastSwitchTime = currentMillis;
+    changed = true;
+    checkState(currentMillis, true);
   }
+}
 
-  // Update LEDs with debounce
-  bool warming = (state == STATE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
-  if (currentMillis - lastDebounceTime >= debounceDelay) {
+void updateLEDs(unsigned long currentMillis, float T) {
+    String unit = fahrenheit ? "F" : "C";
+
+    // Update LEDs with debounce
+    bool warming = (state == STATE_ON && T < targetTempC) ? HIGH : (T >= targetTempC + 1.0 ? LOW : digitalRead(yellowPin));
     if (state == STATE_ON) {
       digitalWrite(redPin, warming);
       digitalWrite(greenPin, T >= targetTempC ? HIGH : LOW);
@@ -190,7 +246,7 @@ void loop() {
     Serial.print(" warming=");
     Serial.print(warming);
     Serial.print(" temperature=");
-    Serial.print(displayTemp);
+    Serial.print(T);
     Serial.print(unit);
     Serial.print("/");
     Serial.print(targetTempC);
@@ -215,8 +271,13 @@ void loop() {
     Serial.println();
 
     lastDebounceTime = currentMillis;
-  }
+}
 
+void updateLCD(unsigned long currentMillis, float T) {
+  // Convert to Fahrenheit if needed
+  float displayTemp = fahrenheit ? (T * 9.0 / 5.0 + 32.0) : T;
+
+  String unit = fahrenheit ? "F" : "C";
   // Update LCD
   lcd.clear();
 
@@ -224,6 +285,8 @@ void loop() {
   if (cursorIdx != prevCursorIdx) {
     // Update cursor positions
     lcd.setCursor(0, 0);
+    Serial.print("lcd.cursorIdx=");
+    Serial.println(cursorIdx);
     lcd.write(cursorIdx == 0 ? cursor : ' ');
     lcd.setCursor(0, 1);
     lcd.write(cursorIdx == 1 ? cursor : ' ');
@@ -251,15 +314,27 @@ void loop() {
   }
 
   // First line: Temperature
-  if (lastShownTempI != int(T)) {
+  //if (lastShownTempI != int(T)) {
+  int roundDisplayTemp = (int)(displayTemp);
+  // if ((lastShownTempI != roundDisplayTemp) || (lastUnitIsF != fahrenheit) || (lastTargetTemp != targetTempC)) {
+  if ((abs(lastShownTemp-displayTemp) > variance) || (lastUnitIsF != fahrenheit) || (lastTargetTemp != targetTempC)) {
+    // || (lastShownTempI != stateChangeT)
+    //int roundT = (int)(T);  // NOTE: commented +.5 to round since display should follow *sustained minimum*
+    Serial.print("lcd.T=");
+    Serial.println(displayTemp);
     lcd.setCursor(1, 0);
-    String tempStr = String((int)displayTemp) + "/" + String((int)targetTempC) + unit;
+    String tempStr = String(roundDisplayTemp) + "/" + String((int)targetTempC) + unit;
     lcd.print(tempStr);
-    lastShownTempI = int(T);
+    lastShownTempI = roundDisplayTemp;
+    lastShownTemp = displayTemp;
+    lastUnitIsF = fahrenheit;
+    lastTargetTemp = targetTempC;
   }
 
   // Second line: Time status
   if (lastTempReachedSecond != tempReachedTick / 1000 / 60 || lastTempLostSecond != tempLostTick / 1000 / 60) {
+    Serial.print("lcd.lastTempReachedSecond=");
+    Serial.println(lastTempReachedSecond);
     lcd.setCursor(0, 1);
     String line2;
     if (tempLostTick > -1) {
